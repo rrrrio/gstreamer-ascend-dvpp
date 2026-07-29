@@ -1,0 +1,8 @@
+build*/
+subprojects/
+*.swp
+*.o
+*.so
+*.a
+*.log
+.cache/
