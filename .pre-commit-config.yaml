@@ -15,6 +15,7 @@ repos:
             "--exclude=src/zetton/common/logging/loguru.cc",
             "--exclude=include/zetton/common/util/args.h",
             "--exclude=include/zetton/common/serialization/json.h",
+            "--filter=-readability/casting,-build/include_subdir",
           ]
   # CMake
   - repo: https://github.com/cheshirekow/cmake-format-precommit
@@ -56,7 +57,7 @@ repos:
         args:
           [
             "--check-filenames",
-            "--ignore-words-list=ned,ser,astroid,ths,aAfter,childRes,thirdparty,ND,parm,empy",
+            "--ignore-words-list=ned,ser,astroid,ths,aAfter,childRes,thirdparty,ND,parm,empy,CANN",
           ]
   - repo: https://github.com/gitleaks/gitleaks
     rev: v8.23.1

@@ -1,0 +1,6 @@
+option('with_ascend', type : 'boolean', value : false,
+  description : 'Build against Ascend CANN ACL DVPP libraries')
+option('ascend_prefix', type : 'string', value : '/usr/local/Ascend/cann',
+  description : 'CANN installation prefix containing aarch64-linux/include and lib64')
+option('tests', type : 'boolean', value : true,
+  description : 'Build host-side unit tests')
