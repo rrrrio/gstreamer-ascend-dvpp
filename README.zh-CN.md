@@ -23,6 +23,8 @@ DVPP 包含独立的 VPC、JPEGD、JPEGE、VDEC 和 VENC 服务。本插件将�
   - [快速体验](#快速体验)
   - [高级用法](#高级用法)
     - [`device-id` 属性](#device-id-属性)
+    - [裁剪属性](#裁剪属性)
+    - [宽输入裁剪缩放与编码](#宽输入裁剪缩放与编码)
     - [`inflight-depth` 属性](#inflight-depth-属性)
     - [`stream-count` 属性](#stream-count-属性)
     - [NPU 与 DVPP 监控](#npu-与-dvpp-监控)
@@ -51,8 +53,9 @@ DVPP 包含独立的 VPC、JPEGD、JPEGE、VDEC 和 VENC 服务。本插件将�
 
 | 组件 | 最低版本 | 说明 |
 | --- | --- | --- |
-| GStreamer | 1.20 | 需要 `gstreamer-1.0`、base 和 video 库 |
-| Meson / Ninja | 当前发行版版本 | 构建系统 |
+| GStreamer | 1.20+ | `gstreamer-1.0`、`gstreamer-base-1.0`、`gstreamer-video-1.0`、`gstreamer-allocators-1.0` 开发文件 |
+| GLib | 2.0 开发文件 | 插件和测试必需 |
+| 构建工具 | C 编译器、`pkg-config`、Meson、Ninja | 编译必需 |
 | CANN | 推荐 9.x | 提供 ACL DVPP 头文件和库 |
 | 昇腾产品 | Atlas 推理系列 | 首个验证目标为 Ascend 310P3 |
 | Linux 设备节点 | `/dev/davinci*`、`/dev/devmm_svm` | 硬件执行必需 |
@@ -62,6 +65,11 @@ DVPP 包含独立的 VPC、JPEGD、JPEGE、VDEC 和 VENC 服务。本插件将�
     aarch64-linux/include/acl/ops/acl_dvpp.h
     aarch64-linux/lib64/libacl_dvpp.so
     aarch64-linux/lib64/libascendcl.so
+
+项目直接链接的 CANN 库是 `libacl_dvpp.so` 和 `libascendcl.so`。编译和
+运行前都要执行 CANN 的 `set_env.sh`，由它把这些库的传递依赖加入
+`LD_LIBRARY_PATH`。Mock 构建只需要 GStreamer 和 GLib 开发包，不需要 CANN
+或昇腾设备。
 
 ## 编译与安装
 
@@ -136,6 +144,49 @@ gst-launch-1.0 videotestsrc num-buffers=30 ! \
   video/x-raw,format=NV12,width=640,height=480 ! \
   ascendvideoconvert device-id=1 ! fakesink
 ```
+
+### 裁剪属性
+
+`ascendvideoconvert` 提供四个无符号裁剪属性，值表示从对应输入边缘
+移除的像素数：
+
+| 属性 | 含义 |
+| --- | --- |
+| `crop-left` | 从左边缘移除像素 |
+| `crop-right` | 从右边缘移除像素 |
+| `crop-top` | 从上边缘移除像素 |
+| `crop-bottom` | 从下边缘移除像素 |
+
+输出宽高通过协商得到的 `video/x-raw` caps 指定。转换器会验证 DVPP stride
+和 ROI 奇偶约束；不支持的几何尺寸会报错，不会静默退回 CPU 裁剪或缩放。
+
+### 宽输入裁剪缩放与编码
+
+对于 CPU 生成的 `4240x514` BGR 测试帧，两路都使用 DVPP：
+
+```bash
+# 主路：BGR 4240x514 -> NV12 4096x496 -> H.265
+gst-launch-1.0 -e videotestsrc num-buffers=1 pattern=black ! \
+    video/x-raw,format=BGR,width=4240,height=514,framerate=1/1 ! \
+    ascendvideoconvert device-id=0 ! \
+    video/x-raw,format=NV12,width=4096,height=496 ! \
+    ascendh265enc ! h265parse ! filesink location=main.h265
+
+# 预览路：左右各裁 20、上下各裁 50，再 NV12 4096x404 -> H.264
+gst-launch-1.0 -e videotestsrc num-buffers=1 pattern=black ! \
+    video/x-raw,format=BGR,width=4240,height=514,framerate=1/1 ! \
+    ascendvideoconvert device-id=0 crop-left=20 crop-right=20 \
+      crop-top=50 crop-bottom=50 ! \
+    video/x-raw,format=NV12,width=4096,height=404 ! \
+    ascendh264enc ! h264parse ! filesink location=preview.h264
+```
+
+在 Ascend 310P 上，宽度超过 4096 的 packed BGR 输入会先在设备内存中
+分成多个 tile，再提交 VPC。这是产品对大尺寸输入的限制所要求的路径；
+分块拷贝以及裁剪/缩放/粘贴仍在设备上完成。不要在这些分支插入 CPU
+`videocrop` 或 `videoscale`。具体 stride、ROI、单次请求失败记录和硬件
+EOS 结果见
+[`docs/hardware-matrix.md`](docs/hardware-matrix.md)。
 
 ### `inflight-depth` 属性
 

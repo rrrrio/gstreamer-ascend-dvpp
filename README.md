@@ -23,6 +23,8 @@ media buffers on hardware builds.
   - [Quick Start](#quick-start)
   - [Advanced Usage](#advanced-usage)
     - [`device-id` Property](#device-id-property)
+    - [Crop Properties](#crop-properties)
+    - [Wide Input Crop, Resize, and Encode](#wide-input-crop-resize-and-encode)
     - [`inflight-depth` Property](#inflight-depth-property)
     - [`stream-count` Property](#stream-count-property)
     - [NPU and DVPP Monitoring](#npu-and-dvpp-monitoring)
@@ -52,9 +54,10 @@ media buffers on hardware builds.
 
 | component | minimum version | note |
 | --- | --- | --- |
-| GStreamer | 1.20 | `gstreamer-1.0`, base and video libraries |
-| Meson / Ninja | current distribution versions | build system |
-| CANN | 9.x recommended | provides ACL DVPP headers and libraries |
+| GStreamer | 1.20+ | `gstreamer-1.0`, `gstreamer-base-1.0`, `gstreamer-video-1.0`, and `gstreamer-allocators-1.0` development files |
+| GLib | 2.0 development files | required by the plugin and tests |
+| Build tools | C compiler, `pkg-config`, Meson, Ninja | required for compilation |
+| CANN | 9.x recommended | ACL DVPP headers and libraries |
 | Ascend product | Atlas inference series | first validated target is Ascend 310P3 |
 | Linux device nodes | `/dev/davinci*`, `/dev/devmm_svm` | required for hardware execution |
 
@@ -63,6 +66,12 @@ The hardware build expects CANN under a prefix containing:
     aarch64-linux/include/acl/ops/acl_dvpp.h
     aarch64-linux/lib64/libacl_dvpp.so
     aarch64-linux/lib64/libascendcl.so
+
+The direct CANN link dependencies are `libacl_dvpp.so` and `libascendcl.so`.
+Source the CANN `set_env.sh` before building or running so their transitive
+runtime libraries are on `LD_LIBRARY_PATH`. The mock build requires the
+GStreamer and GLib development packages but does not require CANN or an
+Ascend device.
 
 ## Building & Installation
 
@@ -139,6 +148,51 @@ gst-launch-1.0 videotestsrc num-buffers=30 ! \
   video/x-raw,format=NV12,width=640,height=480 ! \
   ascendvideoconvert device-id=1 ! fakesink
 ```
+
+### Crop Properties
+
+`ascendvideoconvert` exposes four unsigned crop properties. They are pixel
+counts removed from the corresponding input edge:
+
+| property | meaning |
+| --- | --- |
+| `crop-left` | remove pixels from the left edge |
+| `crop-right` | remove pixels from the right edge |
+| `crop-top` | remove pixels from the top edge |
+| `crop-bottom` | remove pixels from the bottom edge |
+
+The output width and height are selected with the negotiated `video/x-raw`
+caps. The converter validates DVPP stride and ROI parity and reports an error
+for unsupported geometry; it does not fall back to CPU crop or scaling.
+
+### Wide Input Crop, Resize, and Encode
+
+For a CPU-generated `4240x514` BGR frame, use DVPP for both branches:
+
+```bash
+# Main: BGR 4240x514 -> NV12 4096x496 -> H.265
+gst-launch-1.0 -e videotestsrc num-buffers=1 pattern=black ! \
+    video/x-raw,format=BGR,width=4240,height=514,framerate=1/1 ! \
+    ascendvideoconvert device-id=0 ! \
+    video/x-raw,format=NV12,width=4096,height=496 ! \
+    ascendh265enc ! h265parse ! filesink location=main.h265
+
+# Preview: crop 20/20/50/50, then NV12 4096x404 -> H.264
+gst-launch-1.0 -e videotestsrc num-buffers=1 pattern=black ! \
+    video/x-raw,format=BGR,width=4240,height=514,framerate=1/1 ! \
+    ascendvideoconvert device-id=0 crop-left=20 crop-right=20 \
+      crop-top=50 crop-bottom=50 ! \
+    video/x-raw,format=NV12,width=4096,height=404 ! \
+    ascendh264enc ! h264parse ! filesink location=preview.h264
+```
+
+On Ascend 310P, a packed BGR input wider than 4096 is split into device-memory
+tiles before VPC. This follows the product's >4096 input restrictions; the
+tile copies and crop/resize/paste operations remain on the device. Do not
+insert CPU `videocrop` or `videoscale` into these branches. See
+[`docs/hardware-matrix.md`](docs/hardware-matrix.md) for the exact strides,
+ROIs, failure evidence for the rejected single-request path, and hardware
+EOS results.
 
 ### `inflight-depth` Property
 

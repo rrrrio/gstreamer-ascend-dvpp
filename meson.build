@@ -44,16 +44,8 @@ plugin_target = shared_library('gstascenddvpp', sources,
 
 test_deps = [gst, gst_base, gst_video, gst_allocators, glib, ascend_lib]
 test_env = environment()
-hardware_test_available = true
 if use_ascend
   test_env.prepend('LD_LIBRARY_PATH', ascend_prefix / 'aarch64-linux/lib64')
-  device_probe = run_command('sh', '-c',
-    'for node in /dev/davinci* /dev/devmm_svm; do if test -e "$node"; then exit 0; fi; done; exit 1',
-    check : false)
-  hardware_test_available = device_probe.returncode() == 0
-  if not hardware_test_available
-    message('No Ascend device node found; hardware runtime tests are not registered')
-  endif
 endif
 if get_option('tests')
   test_exe = executable('test-ascend-memory', 'tests/test_ascend_memory.c',
@@ -62,9 +54,7 @@ if get_option('tests')
     c_args : ascend_args,
     link_with : [],
     sources : ['src/gstascendmemory.c', 'src/gstascendruntime.c'])
-  if hardware_test_available
-    test('ascend-memory', test_exe, env : test_env, is_parallel : false)
-  endif
+  test('ascend-memory', test_exe, env : test_env, is_parallel : false)
 
   video_test_exe = executable('test-ascend-video-convert',
     'tests/test_ascend_video_convert.c',
@@ -77,10 +67,8 @@ if get_option('tests')
       'src/gstascendruntime.c',
       'src/gstascendvideoconvert.c',
     ])
-  if hardware_test_available
-    test('ascend-video-convert', video_test_exe, env : test_env,
-      is_parallel : false)
-  endif
+  test('ascend-video-convert', video_test_exe, env : test_env,
+    is_parallel : false)
 
   elements_test_exe = executable('test-ascend-elements',
     'tests/test_ascend_elements.c',
@@ -95,10 +83,23 @@ if get_option('tests')
       'src/gstascendjpeg.c',
       'src/gstascendvideocodec.c',
     ])
-  if hardware_test_available
-    test('ascend-elements', elements_test_exe, env : test_env,
-      is_parallel : false)
-  endif
+  test('ascend-elements', elements_test_exe, env : test_env,
+    is_parallel : false)
+
+  crop_resize_test_exe = executable('test-ascend-crop-resize',
+    'tests/test_ascend_crop_resize.c',
+    include_directories : [inc, ascend_inc],
+    dependencies : test_deps,
+    c_args : ascend_args,
+    link_with : [],
+    sources : [
+      'src/gstascendmemory.c',
+      'src/gstascendruntime.c',
+      'src/gstascendvideoconvert.c',
+      'src/gstascendvideocodec.c',
+    ])
+  test('ascend-crop-resize', crop_resize_test_exe, env : test_env,
+    is_parallel : false)
 
   plugin_test_exe = executable('test-ascend-plugin',
     'tests/test_ascend_plugin.c',

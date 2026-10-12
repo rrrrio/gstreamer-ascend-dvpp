@@ -17,6 +17,10 @@ struct _GstAscendVideoConvert {
   gboolean active;
   gboolean allocation_runtime_active;
   gboolean draining;
+  guint crop_left;
+  guint crop_right;
+  guint crop_top;
+  guint crop_bottom;
   GstVideoInfo in_info;
   GstVideoInfo out_info;
   GQueue pending;
@@ -44,14 +48,32 @@ typedef struct {
   gboolean input_buffer_device;
   gboolean input_pool_device;
   gboolean output_buffer_device;
+  gboolean tiled;
   GstAscendPicture input;
   GstAscendPicture output;
   guint input_size;
   guint output_size;
 #if GST_ASCEND_HAVE_ACL
   aclrtStream stream;
+  acldvppRoiConfig *crop;
+  guint tile_count;
+  gpointer tile_device[2];
+  GstAscendPicture tile_input[2];
+  acldvppRoiConfig *tile_crop[2];
+  acldvppRoiConfig *tile_paste[2];
 #endif
 } GstAscendVpcJob;
+
+enum {
+  PROP_0,
+  PROP_DEVICE_ID,
+  PROP_INFLIGHT_DEPTH,
+  PROP_STREAM_COUNT,
+  PROP_CROP_LEFT,
+  PROP_CROP_RIGHT,
+  PROP_CROP_TOP,
+  PROP_CROP_BOTTOM,
+};
 
 static void gst_ascend_video_convert_clear_pending(GstAscendVideoConvert *self);
 static void gst_ascend_video_convert_clear_input_pool(
@@ -60,15 +82,50 @@ static void gst_ascend_video_convert_clear_input_pool(
 G_DEFINE_TYPE(GstAscendVideoConvert, gst_ascend_video_convert,
               GST_TYPE_VIDEO_FILTER)
 
-#define ASCEND_RAW_FORMATS "{ NV12, NV21, RGBA, BGRA, RGB, BGR }"
-#define ASCEND_RAW_CAPS                                       \
-  "video/x-raw, format = (string) " ASCEND_RAW_FORMATS        \
-  ", width = (int) [ 2, 8192 ], height = (int) [ 2, 8192 ], " \
+#define ASCEND_RAW_CAPS                                      \
+  "video/x-raw, format = (string) { NV12, NV21 }, "          \
+  "width = (int) [ 32, 8192 ], height = (int) [ 6, 4096 ], " \
+  "framerate = (fraction) [ 0, max ]; "                      \
+  "video/x-raw, format = (string) { RGB, BGR }, "            \
+  "width = (int) [ 32, 5461 ], height = (int) [ 6, 4096 ], " \
+  "framerate = (fraction) [ 0, max ]; "                      \
+  "video/x-raw, format = (string) { RGBA, BGRA }, "          \
+  "width = (int) [ 32, 4096 ], height = (int) [ 6, 4096 ], " \
   "framerate = (fraction) [ 0, max ]"
+
+#define ASCEND_DVPP_MIN_WIDTH_STRIDE 32u
+#define ASCEND_DVPP_MAX_WIDTH_STRIDE (4096u * 4u)
+#define ASCEND_DVPP_MIN_HEIGHT_STRIDE 6u
+#define ASCEND_DVPP_MAX_HEIGHT_STRIDE 4096u
+#define ASCEND_DVPP_NON_8K_MAX_WIDTH 4096u
 
 static guint align_up(guint value, guint alignment) {
   return (value + alignment - 1) / alignment * alignment;
 }
+
+static guint format_bytes_per_pixel(GstVideoFormat format) {
+  switch (format) {
+    case GST_VIDEO_FORMAT_RGB:
+    case GST_VIDEO_FORMAT_BGR:
+      return 3;
+    case GST_VIDEO_FORMAT_RGBA:
+    case GST_VIDEO_FORMAT_BGRA:
+      return 4;
+    default:
+      return 0;
+  }
+}
+
+static guint format_width_stride(GstVideoFormat format, guint width) {
+  guint bytes_per_pixel = format_bytes_per_pixel(format);
+  guint64 row_bytes = width;
+
+  if (bytes_per_pixel != 0) row_bytes *= bytes_per_pixel;
+  if (row_bytes > G_MAXUINT) return 0;
+  return align_up((guint)row_bytes, 16);
+}
+
+static guint format_height_stride(guint height) { return align_up(height, 2); }
 
 static guint format_to_acl(GstVideoFormat format) {
   switch (format) {
@@ -97,13 +154,89 @@ static guint picture_size(GstVideoFormat format, guint width_stride,
       return width_stride * height_stride * 3 / 2;
     case GST_VIDEO_FORMAT_RGB:
     case GST_VIDEO_FORMAT_BGR:
-      return width_stride * height_stride * 3;
     case GST_VIDEO_FORMAT_RGBA:
     case GST_VIDEO_FORMAT_BGRA:
-      return width_stride * height_stride * 4;
+      return width_stride * height_stride;
     default:
       return 0;
   }
+}
+
+static gboolean validate_geometry(GstVideoFormat format, guint width,
+                                  guint height, GError **error) {
+  guint width_stride = format_width_stride(format, width);
+  guint height_stride = format_height_stride(height);
+
+  if (width_stride < ASCEND_DVPP_MIN_WIDTH_STRIDE ||
+      width_stride > ASCEND_DVPP_MAX_WIDTH_STRIDE ||
+      height_stride < ASCEND_DVPP_MIN_HEIGHT_STRIDE ||
+      height_stride > ASCEND_DVPP_MAX_HEIGHT_STRIDE) {
+    g_set_error(error, GST_LIBRARY_ERROR, GST_LIBRARY_ERROR_SETTINGS,
+                "unsupported DVPP geometry %s %ux%u: stride %ux%u is outside "
+                "the supported range %u..%u x %u..%u",
+                gst_video_format_to_string(format), width, height, width_stride,
+                height_stride, ASCEND_DVPP_MIN_WIDTH_STRIDE,
+                ASCEND_DVPP_MAX_WIDTH_STRIDE, ASCEND_DVPP_MIN_HEIGHT_STRIDE,
+                ASCEND_DVPP_MAX_HEIGHT_STRIDE);
+    return FALSE;
+  }
+  return TRUE;
+}
+
+static gboolean validate_crop(const GstAscendVideoConvert *self,
+                              GstVideoFormat input_format, guint input_width,
+                              guint input_height, GstVideoFormat output_format,
+                              guint output_width, guint output_height,
+                              GError **error) {
+  guint crop_width;
+  guint crop_height;
+  guint right;
+  guint bottom;
+
+  if (self->crop_left >= input_width || self->crop_right >= input_width ||
+      self->crop_left + self->crop_right >= input_width ||
+      self->crop_top >= input_height || self->crop_bottom >= input_height ||
+      self->crop_top + self->crop_bottom >= input_height) {
+    g_set_error(error, GST_LIBRARY_ERROR, GST_LIBRARY_ERROR_SETTINGS,
+                "crop offsets exceed input geometry %ux%u: left=%u right=%u "
+                "top=%u bottom=%u",
+                input_width, input_height, self->crop_left, self->crop_right,
+                self->crop_top, self->crop_bottom);
+    return FALSE;
+  }
+
+  right = input_width - self->crop_right - 1;
+  bottom = input_height - self->crop_bottom - 1;
+  crop_width = input_width - self->crop_left - self->crop_right;
+  crop_height = input_height - self->crop_top - self->crop_bottom;
+  if ((self->crop_left & 1u) != 0 || (self->crop_top & 1u) != 0 ||
+      (right & 1u) == 0 || (bottom & 1u) == 0) {
+    g_set_error(error, GST_LIBRARY_ERROR, GST_LIBRARY_ERROR_SETTINGS,
+                "DVPP ROI requires even left/top and odd right/bottom "
+                "coordinates: left=%u right=%u top=%u bottom=%u",
+                self->crop_left, right, self->crop_top, bottom);
+    return FALSE;
+  }
+  if ((output_format == GST_VIDEO_FORMAT_NV12 ||
+       output_format == GST_VIDEO_FORMAT_NV21) &&
+      ((crop_width & 1u) != 0 || (crop_height & 1u) != 0)) {
+    g_set_error(error, GST_LIBRARY_ERROR, GST_LIBRARY_ERROR_SETTINGS,
+                "NV12/NV21 output requires an even cropped source, got %ux%u",
+                crop_width, crop_height);
+    return FALSE;
+  }
+  if ((output_format == GST_VIDEO_FORMAT_NV12 ||
+       output_format == GST_VIDEO_FORMAT_NV21) &&
+      ((output_width & 1u) != 0 || (output_height & 1u) != 0)) {
+    g_set_error(error, GST_LIBRARY_ERROR, GST_LIBRARY_ERROR_SETTINGS,
+                "NV12/NV21 output requires even dimensions, got %ux%u",
+                output_width, output_height);
+    return FALSE;
+  }
+  if (!validate_geometry(input_format, input_width, input_height, error) ||
+      !validate_geometry(output_format, output_width, output_height, error))
+    return FALSE;
+  return TRUE;
 }
 
 static gboolean gst_ascend_video_convert_start(GstBaseTransform *transform) {
@@ -158,16 +291,10 @@ static GstCaps *gst_ascend_video_convert_transform_caps(
     GstBaseTransform *transform, GstPadDirection direction, GstCaps *caps,
     GstCaps *filter) {
   GstCaps *result = gst_caps_from_string(ASCEND_RAW_CAPS);
-  guint i;
   (void)transform;
   (void)direction;
   (void)caps;
 
-  for (i = 0; i < gst_caps_get_size(result); i++) {
-    GstStructure *structure = gst_caps_get_structure(result, i);
-    gst_structure_set(structure, "width", GST_TYPE_INT_RANGE, 2, 8192, "height",
-                      GST_TYPE_INT_RANGE, 2, 8192, NULL);
-  }
   if (filter != NULL) {
     GstCaps *intersection =
         gst_caps_intersect_full(filter, result, GST_CAPS_INTERSECT_FIRST);
@@ -208,9 +335,19 @@ static gboolean gst_ascend_video_convert_set_info(GstVideoFilter *filter,
                                                   GstCaps *outcaps,
                                                   GstVideoInfo *out_info) {
   GstAscendVideoConvert *self = GST_ASCEND_VIDEO_CONVERT(filter);
+  GError *error = NULL;
   if (format_to_acl(GST_VIDEO_INFO_FORMAT(in_info)) == G_MAXUINT ||
       format_to_acl(GST_VIDEO_INFO_FORMAT(out_info)) == G_MAXUINT) {
     GST_ERROR_OBJECT(filter, "unsupported input/output format");
+    return FALSE;
+  }
+  if (!validate_crop(
+          self, GST_VIDEO_INFO_FORMAT(in_info), GST_VIDEO_INFO_WIDTH(in_info),
+          GST_VIDEO_INFO_HEIGHT(in_info), GST_VIDEO_INFO_FORMAT(out_info),
+          GST_VIDEO_INFO_WIDTH(out_info), GST_VIDEO_INFO_HEIGHT(out_info),
+          &error)) {
+    GST_ERROR_OBJECT(filter, "%s", error->message);
+    g_clear_error(&error);
     return FALSE;
   }
   (void)incaps;
@@ -223,6 +360,15 @@ static gboolean gst_ascend_video_convert_set_info(GstVideoFilter *filter,
 
 static void gst_ascend_vpc_job_free(GstAscendVpcJob *job) {
   if (job == NULL) return;
+#if GST_ASCEND_HAVE_ACL
+  if (job->crop != NULL) acldvppDestroyRoiConfig(job->crop);
+  for (guint i = 0; i < G_N_ELEMENTS(job->tile_input); i++) {
+    if (job->tile_crop[i] != NULL) acldvppDestroyRoiConfig(job->tile_crop[i]);
+    if (job->tile_paste[i] != NULL) acldvppDestroyRoiConfig(job->tile_paste[i]);
+    gst_ascend_picture_clear(&job->tile_input[i]);
+    gst_ascend_dvpp_free(job->tile_device[i]);
+  }
+#endif
   gst_ascend_picture_clear(&job->input);
   gst_ascend_picture_clear(&job->output);
   if (job->output_mapped)
@@ -267,16 +413,27 @@ static gboolean gst_ascend_vpc_job_submit(GstAscendVideoConvert *self,
       gst_base_transform_get_buffer_pool(GST_BASE_TRANSFORM(self));
   GstVideoFormat in_format = GST_VIDEO_INFO_FORMAT(&self->in_info);
   GstVideoFormat out_format = GST_VIDEO_INFO_FORMAT(&self->out_info);
-  guint in_width_stride = align_up(GST_VIDEO_INFO_WIDTH(&self->in_info), 16);
-  guint out_width_stride = align_up(GST_VIDEO_INFO_WIDTH(&self->out_info), 16);
-  guint in_height_stride = align_up(GST_VIDEO_INFO_HEIGHT(&self->in_info), 2);
-  guint out_height_stride = align_up(GST_VIDEO_INFO_HEIGHT(&self->out_info), 2);
+  guint input_width = GST_VIDEO_INFO_WIDTH(&self->in_info);
+  guint input_height = GST_VIDEO_INFO_HEIGHT(&self->in_info);
+  guint output_width = GST_VIDEO_INFO_WIDTH(&self->out_info);
+  guint output_height = GST_VIDEO_INFO_HEIGHT(&self->out_info);
+  guint in_width_stride = format_width_stride(in_format, input_width);
+  guint out_width_stride = format_width_stride(out_format, output_width);
+  guint in_height_stride = format_height_stride(input_height);
+  guint out_height_stride = format_height_stride(output_height);
+  gsize input_device_size = 0;
+  gsize output_device_size = 0;
   GError *error = NULL;
   GstFlowReturn flow;
 
   GST_DEBUG_OBJECT(self, "submitting VPC job");
   job->input_buffer = gst_buffer_ref(input_buffer);
   job->owner = self;
+  if (!validate_crop(self, in_format, input_width, input_height, out_format,
+                     output_width, output_height, &error))
+    goto failed;
+  job->tiled = format_bytes_per_pixel(in_format) != 0 &&
+               input_width > ASCEND_DVPP_NON_8K_MAX_WIDTH;
   job->input_size = picture_size(in_format, in_width_stride, in_height_stride);
   job->output_size =
       picture_size(out_format, out_width_stride, out_height_stride);
@@ -300,24 +457,51 @@ static gboolean gst_ascend_vpc_job_submit(GstAscendVideoConvert *self,
   }
 
   if (gst_ascend_buffer_get_device_data(input_buffer, &job->input_device,
-                                        NULL)) {
+                                        &input_device_size)) {
+    if (input_device_size < job->input_size) {
+      g_set_error(&error, GST_LIBRARY_ERROR, GST_LIBRARY_ERROR_SETTINGS,
+                  "input DVPP buffer is too small: got %" G_GSIZE_FORMAT
+                  ", need %u",
+                  input_device_size, job->input_size);
+      goto failed;
+    }
     job->input_buffer_device = TRUE;
   } else if (!gst_buffer_map(input_buffer, &job->input_map, GST_MAP_READ)) {
     goto failed;
   } else {
     job->input_mapped = TRUE;
+    if (job->input_map.size < job->input_size) {
+      g_set_error(&error, GST_LIBRARY_ERROR, GST_LIBRARY_ERROR_SETTINGS,
+                  "input buffer is too small: got %" G_GSIZE_FORMAT ", need %u",
+                  job->input_map.size, job->input_size);
+      goto failed;
+    }
     job->input_device = gst_ascend_video_convert_acquire_input_memory(
         self, job->input_size, &error);
     if (job->input_device == NULL) goto failed;
     job->input_pool_device = TRUE;
   }
 
-  if (!gst_ascend_buffer_get_device_data(job->output_buffer,
-                                         &job->output_device, NULL)) {
+  if (!gst_ascend_buffer_get_device_data(
+          job->output_buffer, &job->output_device, &output_device_size)) {
     if (!gst_ascend_dvpp_alloc(job->output_size, &job->output_device, &error))
       goto failed;
   } else {
+    if (output_device_size < job->output_size) {
+      g_set_error(&error, GST_LIBRARY_ERROR, GST_LIBRARY_ERROR_SETTINGS,
+                  "output DVPP buffer is too small: got %" G_GSIZE_FORMAT
+                  ", need %u",
+                  output_device_size, job->output_size);
+      goto failed;
+    }
     job->output_buffer_device = TRUE;
+  }
+  if (!job->output_buffer_device &&
+      gst_buffer_get_size(job->output_buffer) < job->output_size) {
+    g_set_error(&error, GST_LIBRARY_ERROR, GST_LIBRARY_ERROR_SETTINGS,
+                "output buffer is too small: got %" G_GSIZE_FORMAT ", need %u",
+                gst_buffer_get_size(job->output_buffer), job->output_size);
+    goto failed;
   }
 
   GST_DEBUG_OBJECT(self,
@@ -326,16 +510,15 @@ static gboolean gst_ascend_vpc_job_submit(GstAscendVideoConvert *self,
                    job->input_buffer_device, job->output_buffer_device,
                    job->input_pool_device);
 
-  if (!gst_ascend_picture_init(
-          &job->input, GST_VIDEO_INFO_WIDTH(&self->in_info),
-          GST_VIDEO_INFO_HEIGHT(&self->in_info), in_width_stride,
-          in_height_stride, job->input_size, format_to_acl(in_format),
-          job->input_device, &error) ||
-      !gst_ascend_picture_init(
-          &job->output, GST_VIDEO_INFO_WIDTH(&self->out_info),
-          GST_VIDEO_INFO_HEIGHT(&self->out_info), out_width_stride,
-          out_height_stride, job->output_size, format_to_acl(out_format),
-          job->output_device, &error))
+  if ((!job->tiled &&
+       !gst_ascend_picture_init(&job->input, input_width, input_height,
+                                in_width_stride, in_height_stride,
+                                job->input_size, format_to_acl(in_format),
+                                job->input_device, &error)) ||
+      !gst_ascend_picture_init(&job->output, output_width, output_height,
+                               out_width_stride, out_height_stride,
+                               job->output_size, format_to_acl(out_format),
+                               job->output_device, &error))
     goto failed;
 
 #if GST_ASCEND_HAVE_ACL
@@ -343,10 +526,9 @@ static gboolean gst_ascend_vpc_job_submit(GstAscendVideoConvert *self,
       self->streams[self->submit_sequence % self->stream_count_active];
   self->submit_sequence++;
   if (!job->input_buffer_device) {
-    aclError ret = aclrtMemcpyAsync(
-        job->input_device, job->input_size, job->input_map.data,
-        MIN(job->input_map.size, (gsize)job->input_size),
-        ACL_MEMCPY_HOST_TO_DEVICE, job->stream);
+    aclError ret = aclrtMemcpyAsync(job->input_device, job->input_size,
+                                    job->input_map.data, job->input_size,
+                                    ACL_MEMCPY_HOST_TO_DEVICE, job->stream);
     if (ret != ACL_SUCCESS) {
       const gchar *recent = aclGetRecentErrMsg();
       g_set_error(&error, GST_LIBRARY_ERROR, GST_LIBRARY_ERROR_INIT,
@@ -355,22 +537,107 @@ static gboolean gst_ascend_vpc_job_submit(GstAscendVideoConvert *self,
       goto failed;
     }
   }
-  {
-    aclError ret =
-        acldvppVpcResizeAsync(self->channel, job->input.desc, job->output.desc,
-                              self->resize, job->stream);
-    if (ret != ACL_SUCCESS) {
-      const gchar *recent = aclGetRecentErrMsg();
+  if (job->tiled) {
+    guint source_width = input_width - self->crop_left - self->crop_right;
+    guint source_height = input_height - self->crop_top - self->crop_bottom;
+    guint bytes_per_pixel = format_bytes_per_pixel(in_format);
+    guint source_x = self->crop_left;
+    guint output_x = 0;
+    guint tile_count = source_width > ASCEND_DVPP_NON_8K_MAX_WIDTH ? 2 : 1;
+
+    job->tile_count = tile_count;
+    for (guint i = 0; i < tile_count; i++) {
+      guint source_tile_width =
+          tile_count == 1 ? source_width : (source_width / 2) & ~3u;
+      guint output_tile_width =
+          tile_count == 1 ? output_width : (output_width / 2) & ~1u;
+      guint tile_width_stride;
+      guint tile_height_stride = format_height_stride(source_height);
+      guint tile_size;
+      gsize row_bytes;
+
+      if (i == tile_count - 1 && tile_count == 2) {
+        source_tile_width = source_width - ((source_width / 2) & ~3u);
+        output_tile_width = output_width - ((output_width / 2) & ~1u);
+      }
+      tile_width_stride = format_width_stride(in_format, source_tile_width);
+      tile_size =
+          picture_size(in_format, tile_width_stride, tile_height_stride);
+      row_bytes = (gsize)source_tile_width * bytes_per_pixel;
+      if (!gst_ascend_dvpp_alloc(tile_size, &job->tile_device[i], &error) ||
+          !gst_ascend_picture_init(
+              &job->tile_input[i], source_tile_width, source_height,
+              tile_width_stride, tile_height_stride, tile_size,
+              format_to_acl(in_format), job->tile_device[i], &error))
+        goto failed;
+
+      for (guint row = 0; row < source_height; row++) {
+        gpointer dst =
+            (guint8 *)job->tile_device[i] + (gsize)row * tile_width_stride;
+        gpointer src = (guint8 *)job->input_device +
+                       (gsize)(self->crop_top + row) * in_width_stride +
+                       (gsize)source_x * bytes_per_pixel;
+        aclError ret =
+            aclrtMemcpyAsync(dst, row_bytes, src, row_bytes,
+                             ACL_MEMCPY_DEVICE_TO_DEVICE, job->stream);
+        if (ret != ACL_SUCCESS) {
+          const gchar *recent = aclGetRecentErrMsg();
+          g_set_error(&error, GST_LIBRARY_ERROR, GST_LIBRARY_ERROR_INIT,
+                      "tile device copy failed: ret=%d, recent=%s", (gint)ret,
+                      recent != NULL ? recent : "<none>");
+          goto failed;
+        }
+      }
+      job->tile_crop[i] = acldvppCreateRoiConfig(0, source_tile_width - 1, 0,
+                                                 source_height - 1);
+      job->tile_paste[i] = acldvppCreateRoiConfig(
+          output_x, output_x + output_tile_width - 1, 0, output_height - 1);
+      if (job->tile_crop[i] == NULL || job->tile_paste[i] == NULL) {
+        g_set_error(&error, GST_LIBRARY_ERROR, GST_LIBRARY_ERROR_INIT,
+                    "failed to create DVPP tile ROI configuration");
+        goto failed;
+      }
+      {
+        aclError ret = acldvppVpcCropResizePasteAsync(
+            self->channel, job->tile_input[i].desc, job->output.desc,
+            job->tile_crop[i], job->tile_paste[i], self->resize, job->stream);
+        if (ret != ACL_SUCCESS) {
+          const gchar *recent = aclGetRecentErrMsg();
+          g_set_error(&error, GST_LIBRARY_ERROR, GST_LIBRARY_ERROR_INIT,
+                      "acldvppVpcCropResizePasteAsync tile %u failed: ret=%d, "
+                      "recent=%s",
+                      i, (gint)ret, recent != NULL ? recent : "<none>");
+          goto failed;
+        }
+      }
+      source_x += source_tile_width;
+      output_x += output_tile_width;
+    }
+  } else {
+    job->crop = acldvppCreateRoiConfig(
+        self->crop_left, input_width - self->crop_right - 1, self->crop_top,
+        input_height - self->crop_bottom - 1);
+    if (job->crop == NULL) {
       g_set_error(&error, GST_LIBRARY_ERROR, GST_LIBRARY_ERROR_INIT,
-                  "acldvppVpcResizeAsync failed: ret=%d, recent=%s", (gint)ret,
-                  recent != NULL ? recent : "<none>");
+                  "acldvppCreateRoiConfig failed");
       goto failed;
+    }
+    {
+      aclError ret = acldvppVpcCropResizeAsync(self->channel, job->input.desc,
+                                               job->output.desc, job->crop,
+                                               self->resize, job->stream);
+      if (ret != ACL_SUCCESS) {
+        const gchar *recent = aclGetRecentErrMsg();
+        g_set_error(&error, GST_LIBRARY_ERROR, GST_LIBRARY_ERROR_INIT,
+                    "acldvppVpcCropResizeAsync failed: ret=%d, recent=%s",
+                    (gint)ret, recent != NULL ? recent : "<none>");
+        goto failed;
+      }
     }
   }
 #else
   if (!job->input_buffer_device) {
-    memcpy(job->input_device, job->input_map.data,
-           MIN(job->input_map.size, (gsize)job->input_size));
+    memcpy(job->input_device, job->input_map.data, job->input_size);
   }
   if (in_format == out_format &&
       GST_VIDEO_INFO_WIDTH(&self->in_info) ==
@@ -388,6 +655,9 @@ static gboolean gst_ascend_vpc_job_submit(GstAscendVideoConvert *self,
 
 failed:
   if (pool != NULL) gst_object_unref(pool);
+#if GST_ASCEND_HAVE_ACL
+  if (job->stream != NULL) aclrtSynchronizeStream(job->stream);
+#endif
   if (error != NULL) {
     GST_ERROR_OBJECT(self, "VPC submit failed: %s", error->message);
     g_clear_error(&error);
@@ -598,14 +868,14 @@ static GstFlowReturn gst_ascend_video_convert_transform_frame(
   GstAscendVideoConvert *self = GST_ASCEND_VIDEO_CONVERT(filter);
   GstVideoFormat in_format = GST_VIDEO_FRAME_FORMAT(inframe);
   GstVideoFormat out_format = GST_VIDEO_FRAME_FORMAT(outframe);
-  guint in_width_stride = align_up(
-      GST_VIDEO_FRAME_WIDTH(inframe),
-      (in_format == GST_VIDEO_FORMAT_RGB || in_format == GST_VIDEO_FORMAT_BGR)
-          ? 16
-          : 16);
-  guint out_width_stride = align_up(GST_VIDEO_FRAME_WIDTH(outframe), 16);
-  guint in_height_stride = align_up(GST_VIDEO_FRAME_HEIGHT(inframe), 2);
-  guint out_height_stride = align_up(GST_VIDEO_FRAME_HEIGHT(outframe), 2);
+  guint in_width_stride =
+      format_width_stride(in_format, GST_VIDEO_FRAME_WIDTH(inframe));
+  guint out_width_stride =
+      format_width_stride(out_format, GST_VIDEO_FRAME_WIDTH(outframe));
+  guint in_height_stride =
+      format_height_stride(GST_VIDEO_FRAME_HEIGHT(inframe));
+  guint out_height_stride =
+      format_height_stride(GST_VIDEO_FRAME_HEIGHT(outframe));
   guint in_size = picture_size(in_format, in_width_stride, in_height_stride);
   guint out_size =
       picture_size(out_format, out_width_stride, out_height_stride);
@@ -619,8 +889,16 @@ static GstFlowReturn gst_ascend_video_convert_transform_frame(
   GstFlowReturn result = GST_FLOW_ERROR;
   gboolean input_is_buffer_device = FALSE;
   gboolean output_is_buffer_device = FALSE;
+#if GST_ASCEND_HAVE_ACL
+  acldvppRoiConfig *crop = NULL;
+#endif
 
   if (!gst_ascend_runtime_activate(self->device_id, &error)) goto done;
+  if (!validate_crop(self, in_format, GST_VIDEO_FRAME_WIDTH(inframe),
+                     GST_VIDEO_FRAME_HEIGHT(inframe), out_format,
+                     GST_VIDEO_FRAME_WIDTH(outframe),
+                     GST_VIDEO_FRAME_HEIGHT(outframe), &error))
+    goto done;
   if (in_size == 0 || out_size == 0) goto done;
 
   if (gst_ascend_buffer_get_device_data(inframe->buffer, &in_device, NULL)) {
@@ -654,10 +932,15 @@ static GstFlowReturn gst_ascend_video_convert_transform_frame(
   }
 
 #if GST_ASCEND_HAVE_ACL
-  if (acldvppVpcResizeAsync(self->channel, input.desc, output.desc,
-                            self->resize, self->streams[0]) != ACL_SUCCESS ||
+  crop = acldvppCreateRoiConfig(
+      self->crop_left, GST_VIDEO_FRAME_WIDTH(inframe) - self->crop_right - 1,
+      self->crop_top, GST_VIDEO_FRAME_HEIGHT(inframe) - self->crop_bottom - 1);
+  if (crop == NULL ||
+      acldvppVpcCropResizeAsync(self->channel, input.desc, output.desc, crop,
+                                self->resize,
+                                self->streams[0]) != ACL_SUCCESS ||
       aclrtSynchronizeStream(self->streams[0]) != ACL_SUCCESS) {
-    GST_ERROR_OBJECT(self, "DVPP VPC resize failed");
+    GST_ERROR_OBJECT(self, "DVPP VPC crop and resize failed");
     goto done;
   }
 #else
@@ -687,6 +970,9 @@ done:
   }
   gst_ascend_picture_clear(&input);
   gst_ascend_picture_clear(&output);
+#if GST_ASCEND_HAVE_ACL
+  if (crop != NULL) acldvppDestroyRoiConfig(crop);
+#endif
   if (!input_is_buffer_device) gst_ascend_dvpp_free(in_device);
   if (!output_is_buffer_device) gst_ascend_dvpp_free(out_device);
   if (out_map.data != NULL) gst_buffer_unmap(outframe->buffer, &out_map);
@@ -699,28 +985,62 @@ static void gst_ascend_video_convert_set_property(GObject *object,
                                                   const GValue *value,
                                                   GParamSpec *pspec) {
   GstAscendVideoConvert *self = GST_ASCEND_VIDEO_CONVERT(object);
-  if (prop_id == 1)
-    self->device_id = g_value_get_int(value);
-  else if (prop_id == 2)
-    self->inflight_depth = g_value_get_uint(value);
-  else if (prop_id == 3)
-    self->stream_count = g_value_get_uint(value);
-  else
-    G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
+  switch (prop_id) {
+    case PROP_DEVICE_ID:
+      self->device_id = g_value_get_int(value);
+      break;
+    case PROP_INFLIGHT_DEPTH:
+      self->inflight_depth = g_value_get_uint(value);
+      break;
+    case PROP_STREAM_COUNT:
+      self->stream_count = g_value_get_uint(value);
+      break;
+    case PROP_CROP_LEFT:
+      self->crop_left = g_value_get_uint(value);
+      break;
+    case PROP_CROP_RIGHT:
+      self->crop_right = g_value_get_uint(value);
+      break;
+    case PROP_CROP_TOP:
+      self->crop_top = g_value_get_uint(value);
+      break;
+    case PROP_CROP_BOTTOM:
+      self->crop_bottom = g_value_get_uint(value);
+      break;
+    default:
+      G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
+  }
 }
 
 static void gst_ascend_video_convert_get_property(GObject *object,
                                                   guint prop_id, GValue *value,
                                                   GParamSpec *pspec) {
   GstAscendVideoConvert *self = GST_ASCEND_VIDEO_CONVERT(object);
-  if (prop_id == 1)
-    g_value_set_int(value, self->device_id);
-  else if (prop_id == 2)
-    g_value_set_uint(value, self->inflight_depth);
-  else if (prop_id == 3)
-    g_value_set_uint(value, self->stream_count);
-  else
-    G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
+  switch (prop_id) {
+    case PROP_DEVICE_ID:
+      g_value_set_int(value, self->device_id);
+      break;
+    case PROP_INFLIGHT_DEPTH:
+      g_value_set_uint(value, self->inflight_depth);
+      break;
+    case PROP_STREAM_COUNT:
+      g_value_set_uint(value, self->stream_count);
+      break;
+    case PROP_CROP_LEFT:
+      g_value_set_uint(value, self->crop_left);
+      break;
+    case PROP_CROP_RIGHT:
+      g_value_set_uint(value, self->crop_right);
+      break;
+    case PROP_CROP_TOP:
+      g_value_set_uint(value, self->crop_top);
+      break;
+    case PROP_CROP_BOTTOM:
+      g_value_set_uint(value, self->crop_bottom);
+      break;
+    default:
+      G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
+  }
 }
 
 static void gst_ascend_video_convert_class_init(
@@ -741,19 +1061,42 @@ static void gst_ascend_video_convert_class_init(
   G_OBJECT_CLASS(klass)->set_property = gst_ascend_video_convert_set_property;
   G_OBJECT_CLASS(klass)->get_property = gst_ascend_video_convert_get_property;
   g_object_class_install_property(
-      G_OBJECT_CLASS(klass), 1,
+      G_OBJECT_CLASS(klass), PROP_DEVICE_ID,
       g_param_spec_int("device-id", "Device ID", "Ascend device index", 0, 63,
                        0, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
   g_object_class_install_property(
-      G_OBJECT_CLASS(klass), 2,
+      G_OBJECT_CLASS(klass), PROP_INFLIGHT_DEPTH,
       g_param_spec_uint("inflight-depth", "In-flight depth",
                         "Number of VPC jobs submitted before output is retired",
                         1, 64, 4, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
   g_object_class_install_property(
-      G_OBJECT_CLASS(klass), 3,
+      G_OBJECT_CLASS(klass), PROP_STREAM_COUNT,
       g_param_spec_uint("stream-count", "Stream count",
                         "Number of ACL streams used for in-flight VPC jobs", 1,
                         4, 2, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property(
+      G_OBJECT_CLASS(klass), PROP_CROP_LEFT,
+      g_param_spec_uint("crop-left", "Crop left",
+                        "Pixels removed from the left edge before VPC resize",
+                        0, 8192, 0,
+                        G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property(
+      G_OBJECT_CLASS(klass), PROP_CROP_RIGHT,
+      g_param_spec_uint("crop-right", "Crop right",
+                        "Pixels removed from the right edge before VPC resize",
+                        0, 8192, 0,
+                        G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property(
+      G_OBJECT_CLASS(klass), PROP_CROP_TOP,
+      g_param_spec_uint("crop-top", "Crop top",
+                        "Pixels removed from the top edge before VPC resize", 0,
+                        8192, 0, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property(
+      G_OBJECT_CLASS(klass), PROP_CROP_BOTTOM,
+      g_param_spec_uint("crop-bottom", "Crop bottom",
+                        "Pixels removed from the bottom edge before VPC resize",
+                        0, 8192, 0,
+                        G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
   base_class->start = gst_ascend_video_convert_start;
   base_class->stop = gst_ascend_video_convert_stop;
   base_class->sink_event = gst_ascend_video_convert_sink_event;

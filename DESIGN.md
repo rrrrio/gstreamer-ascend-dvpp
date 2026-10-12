@@ -94,6 +94,49 @@ before the stream and device memory are released. The output pool reserves
 `2 * inflight-depth + 4` buffers so a downstream converter can retain upstream
 outputs while both queues are in flight.
 
+### Wide input crop and resize
+
+`ascendvideoconvert` exposes `crop-left`, `crop-right`, `crop-top`, and
+`crop-bottom` as pixel counts removed from the input edges. The output width
+and height are negotiated through the output caps. CANN ROI coordinates are
+inclusive, so the converter derives `right = input_width - crop_right - 1`
+and `bottom = input_height - crop_bottom - 1`; left/top must be even and
+right/bottom must be odd.
+
+The validated wide-input geometry is:
+
+```text
+main:    BGR 4240x514, stride 12720x514, ROI (0,4239,0,513)
+         -> NV12 4096x496, stride 4096x496
+
+preview: BGR 4240x514, stride 12720x514, ROI (20,4219,50,463)
+         -> cropped source 4200x414
+         -> NV12 4096x404, stride 4096x404
+```
+
+On Ascend 310P, a packed input wider than 4096 enters the product's 8K VPC
+path, where BGR888 is not a supported input format. The converter therefore
+uses this explicit device-only path for the 4240-wide input:
+
+```text
+[BGR DVPP input 12720-byte rows]
+                 |
+                 +-- device-to-device row copies --> [BGR tile 0 <= 4096]
+                 |                                      |
+                 |                                      +-- VPC crop/resize/paste --+
+                 +----------------------------------> [BGR tile 1 <= 4096]          |
+                                                        |                            v
+                                                        +-- VPC crop/resize/paste -> [NV12 output]
+```
+
+Each tile has its own DVPP allocation and picture descriptor. Its crop ROI
+covers the tile, and its paste ROI writes a disjoint horizontal range of the
+shared output descriptor. The pending job owns both tile allocations, all ROI
+objects, the input/output buffers, and the ACL stream until synchronization;
+cleanup synchronizes a failed submission before releasing tile memory. No
+`videocrop`, `videoscale`, host-side image transform, or silent CPU fallback is
+used.
+
 The element also exposes `stream-count` (default 2, maximum 4). Jobs select a
 stream in round-robin order and synchronize their own stream on retirement.
 Runtime activation caches the selected device per thread and tags the cache
