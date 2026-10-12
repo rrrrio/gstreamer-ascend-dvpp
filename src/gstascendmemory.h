@@ -8,8 +8,12 @@ G_BEGIN_DECLS
 #define GST_ASCEND_MEMORY_TYPE "AscendDVPP"
 
 GstAllocator *gst_ascend_allocator_obtain(void);
+GstAllocator *gst_ascend_allocator_obtain_for_device(gint device_id);
 GstMemory *gst_ascend_memory_alloc(gsize size);
 gboolean gst_is_ascend_memory(GstMemory *memory);
+gpointer gst_ascend_memory_get_device_data(GstMemory *memory, gsize *size);
+gboolean gst_ascend_buffer_get_device_data(GstBuffer *buffer, gpointer *data,
+                                           gsize *size);
 
 G_END_DECLS
 

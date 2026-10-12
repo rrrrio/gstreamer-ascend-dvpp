@@ -8,9 +8,10 @@ DVPP 包含独立的 VPC、JPEGD、JPEGE、VDEC 和 VENC 服务。本插件将�
 封装为标准 GStreamer element，并在硬件构建中使用 `acldvppMalloc` 申请媒体
 设备内存。
 
-> **状态：** 实验性。VPC 和 JPEGD/JPEGE 已在 Atlas 310P3、CANN
-> 9.1.0-beta.1 上完成基础验证。VDEC/VENC 已完成编译和 element 注册，但仍
-> 需要补充 CANN report 处理线程以及完整目标码流验证。
+> **状态：** 实验性。当前设备产品标识为 `IT21PD2G10`，使用 CANN
+> 9.1.0-beta.1。已完成 VPC、JPEGD/JPEGE、4 帧 H.264/H.265 编码，以及各自
+> 四个 access unit 的 H.264/H.265 解码硬件验证。更完整的 codec profile/码率
+> 组合仍未验证。
 
 ## 目录
 
@@ -22,8 +23,12 @@ DVPP 包含独立的 VPC、JPEGD、JPEGE、VDEC 和 VENC 服务。本插件将�
   - [快速体验](#快速体验)
   - [高级用法](#高级用法)
     - [`device-id` 属性](#device-id-属性)
+    - [`inflight-depth` 属性](#inflight-depth-属性)
+    - [`stream-count` 属性](#stream-count-属性)
     - [NPU 与 DVPP 监控](#npu-与-dvpp-监控)
+    - [CPU 与 DVPP 多路测试](#cpu-与-dvpp-多路测试)
     - [实测性能占用](#实测性能占用)
+    - [优化过程](#优化过程)
     - [主机 Mock 后端](#主机-mock-后端)
   - [最佳实践](#最佳实践)
   - [故障排除](#故障排除)
@@ -132,6 +137,29 @@ gst-launch-1.0 videotestsrc num-buffers=30 ! \
   ascendvideoconvert device-id=1 ! fakesink
 ```
 
+### `inflight-depth` 属性
+
+`ascendvideoconvert` 会先提交多个 VPC job，再回收最早提交的输出。默认
+depth 为 4：
+
+```bash
+gst-launch-1.0 -e videotestsrc is-live=true ! \
+    video/x-raw,format=NV12,width=1920,height=1080,framerate=30/1 ! \
+    ascendvideoconvert device-id=0 inflight-depth=8 ! \
+    video/x-raw,format=NV12,width=640,height=360 ! fakesink sync=false
+```
+
+job 按输入顺序回收。输出 pool 保留 `2 * inflight-depth + 4` 个 buffer，允许
+下游 converter 在两级队列同时运行时继续持有上游输出。Flush 和 EOS 会在
+销毁 ACL stream 及 DVPP memory 之前排空或丢弃 pending job。
+
+### `stream-count` 属性
+
+`stream-count` 控制 in-flight 队列使用的 ACL stream 数量，默认值为 2，
+范围为 1-4。每个 job 在回收前固定使用其提交时选择的 stream，因此多个
+stream 可以重叠执行 H2D copy 和 VPC 请求。调大该值前应结合 `npu-smi`
+检查；它只增加提交并发度，不会突破硬件 VPC 上限。
+
 ### NPU 与 DVPP 监控
 
 当前设备可以使用以下命令监控 device 0：
@@ -141,7 +169,34 @@ watch -n 1 npu-smi info -t usages -i 64 -c 0
 ```
 
 输出中包括 `DVPP VPC`、`DVPP JPEGD`、`DVPP JPEGE`、`DVPP VDEC` 和
-`DVPP VENC` 使用率。
+`DVPP VENC` 使用率。当前验证设备产品标识为 `IT21PD2G10`，并暴露
+`/dev/davinci0`、`/dev/davinci1` 两个设备节点。
+
+### CPU 与 DVPP 多路测试
+
+仓库提供 `tests/benchmark_cpu_vs_dvpp.sh`。脚本只解码一次 H.264，再将
+NV12 帧分发到多路，比较 CPU 的 `videoscale`/`videoconvert` 与
+`ascendvideoconvert`，两侧都输出 640x480 BGR。解码和公共的 NV12 预处理
+不计入两种转换方式的差异：
+
+```bash
+# 使用当前可用的 H.264 encoder 生成测试文件。
+gst-launch-1.0 -e videotestsrc num-buffers=600 ! \
+    video/x-raw,format=I420,width=1920,height=1080,framerate=30/1 ! \
+    openh264enc bitrate=12000000 ! h264parse ! filesink location=test.h264
+
+# CPU 软件转换基线。
+BRANCHES=6 DURATION=20 tests/benchmark_cpu_vs_dvpp.sh cpu test.h264
+
+# Ascend DVPP 转换。
+source /usr/local/Ascend/cann-9.1.0-beta.1/set_env.sh
+export GST_PLUGIN_PATH_1_0="$PWD/build-ascend"
+BRANCHES=6 DURATION=20 tests/benchmark_cpu_vs_dvpp.sh dvpp test.h264
+```
+
+安装了可选的 `cpuusage` tracer 时可以设置 `GST_SHARK_CPUUSAGE=1`。当前
+设备没有安装 gst-shark，脚本会回退到 `ps` 采样 `gst-launch-1.0` 进程，
+设备计数器仍始终通过 `npu-smi` 采集。
 
 ### 实测性能占用
 
@@ -151,12 +206,40 @@ watch -n 1 npu-smi info -t usages -i 64 -c 0
 | 负载 | 测试负载 | 实测占用 |
 | --- | --- | --- |
 | VPC 持续负载 | 16 路并发，1920x1080 NV12 -> 640x360 NV12，定时压测 | preroll 后 DVPP VPC 为 17-18%；DDR 3%；AICPU 3-5%；稳定阶段 CtrlCPU 1-6% |
+| 上游-DVPP VPC 负载 | 8 路并发，1920x1080 NV12@60 -> 640x360 NV12，`inflight-depth=8`，`stream-count=1/2` | DVPP VPC 稳定为 5%；DDR 3-4%；AICPU 1-2%；预热后 CtrlCPU 1-5% |
+| CPU 与 DVPP 转换 | 6 路，一个 600 帧 1920x1080 H.264 输入，NV12 -> 640x480 BGR | CPU 基线：宿主进程 417%；DVPP：宿主进程 100%，DVPP VPC 1.5%，CtrlCPU 4% |
 | JPEGD/JPEGE | 320x240 NV12@30 -> JPEGE -> JPEGD -> NV12，300 帧耗时 9.97 秒 | DVPP JPEGE 峰值 1%；DVPP JPEGD 峰值 1%；DDR 3% |
 
 VPC 持续负载测试是为观察设备占用而设置的定时压测，不是完整 EOS 吞吐
-基准。当前 element 实现会对每次 VPC 请求同步等待，并通过 Host 内存完成
-每帧拷贝，因此该结果是当前实现的压力测试结果，不代表硬件已经满载。DVPP
-列是瞬时整数百分比读数，需要结合 pipeline 结果和采样间隔理解。
+基准。DVPP 列是瞬时整数百分比读数，需要结合 pipeline 结果和采样间隔理解。
+
+### 优化过程
+
+当前分支包含三项增量优化：
+
+1. DVPP-backed output allocation：转换器输出可以由 `AscendDVPP` allocator
+   分配，后续转换器直接使用其 device pointer。转换器还会向上游提出该
+   allocator，使支持 allocation query 的 source 可以直接产出 DVPP memory。
+2. 多帧 in-flight VPC 提交：`inflight-depth` 异步排入 H2D/VPC，并按顺序
+   回收帧。硬件上使用 depth 4、640x480 NV12 -> 320x240 NV12、30 帧的测试
+   已成功 EOS。
+3. Stream 和 runtime 开销优化：`stream-count` 在最多 4 条 ACL stream 之间
+   分配 job；线程级 runtime cache 在同一 runtime 代次内避免重复调用
+   `aclrtSetDevice`。
+
+当上游不接受 allocation query 时，大分辨率 system-memory 输入仍会逐帧
+申请临时 DVPP input buffer。当前设备上 `videotestsrc` 已接受该提议，
+converter debug 报告为 `input-device=1 output-device=1`。
+
+上游-DVPP 压测使用 8 路、1920x1080 NV12@60 -> 640x360 NV12、
+`inflight-depth=8`。`stream-count=1` 和 `stream-count=2` 的 DVPP VPC 都稳定为
+5%（DDR 3-4%，AICPU 1-2%）；同一负载降到 30 fps 时稳定为 2%。这些是采样到的
+占用率，不是硬件满载基准。
+
+CPU 与 DVPP 对比中，宿主 GStreamer 进程 CPU 从 417% 降到 100%，实测下降
+约 76%。DVPP 分支将缩放和 NV12 到 BGR 的转换交给 VPC；解码和公共 NV12
+预处理仍在宿主侧，因此该结果表示转换卸载效果，不是完整的硬件解码端到端
+结果。
 
 ### 主机 Mock 后端
 
@@ -189,7 +272,7 @@ Mock 后端不代表真实 DVPP 的输出质量或性能。
 | `libacl_dvpp_mpi.so: cannot open shared object file` | 未加载 CANN 环境 | 运行 GStreamer 前先执行 CANN 的 `set_env.sh` |
 | `ctx is NULL` 或 `acldvppMalloc failed` | streaming thread 没有 ACL device context | 使用当前版本的线程 device 激活逻辑并检查 `device-id` |
 | `not negotiated` | caps 或尺寸不支持 | 显式指定 NV12/raw caps，并检查目标产品限制 |
-| VDEC/VENC callback timeout | 未运行 CANN report 处理，或输入码流不完整 | 使用完整 access unit；当前版本仍需补充 VDEC/VENC report loop |
+| VDEC/VENC callback timeout | 目标码流不完整、不受支持，或设备 report worker 无法处理 | 使用完整 access unit 并确认目标产品的 codec 能力；当前设备只验证了 `docs/hardware-matrix.md` 中的 H.264/H.265 冒烟码流 |
 | 缺少 `/dev/davinci*` | 昇腾驱动或容器设备映射不可用 | 在加载昇腾驱动且映射设备节点的目标环境运行 |
 
 ## 鸣谢

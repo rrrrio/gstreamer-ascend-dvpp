@@ -7,9 +7,11 @@ DVPP provides dedicated VPC, JPEGD, JPEGE, VDEC and VENC services. This plugin
 exposes them as standard GStreamer elements and uses `acldvppMalloc` for device
 media buffers on hardware builds.
 
-> **Status:** experimental. VPC and JPEGD/JPEGE have been smoke-tested on an
-> Atlas 310P3 with CANN 9.1.0-beta.1. VDEC/VENC are registered and compiled but
-> still need the CANN report-processing loop and complete target codec streams.
+> **Status:** experimental. The current target reports product `IT21PD2G10` and
+> has been tested with CANN 9.1.0-beta.1. The physical validation covers VPC,
+> JPEGD/JPEGE, four-frame H.264/H.265 encode, and four-access-unit H.264/H.265
+> decode. Broader codec profiles and rate-control combinations remain
+> unverified.
 
 ## Table of Contents
 
@@ -21,8 +23,12 @@ media buffers on hardware builds.
   - [Quick Start](#quick-start)
   - [Advanced Usage](#advanced-usage)
     - [`device-id` Property](#device-id-property)
+    - [`inflight-depth` Property](#inflight-depth-property)
+    - [`stream-count` Property](#stream-count-property)
     - [NPU and DVPP Monitoring](#npu-and-dvpp-monitoring)
+    - [CPU vs DVPP Multi-Stream Test](#cpu-vs-dvpp-multi-stream-test)
     - [Measured Occupancy](#measured-occupancy)
+    - [Optimization Progress](#optimization-progress)
     - [Host-only Mock Backend](#host-only-mock-backend)
   - [Best Practice](#best-practice)
   - [Troubleshooting](#troubleshooting)
@@ -134,6 +140,31 @@ gst-launch-1.0 videotestsrc num-buffers=30 ! \
   ascendvideoconvert device-id=1 ! fakesink
 ```
 
+### `inflight-depth` Property
+
+`ascendvideoconvert` submits several VPC jobs before retiring the oldest
+output. The default depth is 4:
+
+```bash
+gst-launch-1.0 -e videotestsrc is-live=true ! \
+    video/x-raw,format=NV12,width=1920,height=1080,framerate=30/1 ! \
+    ascendvideoconvert device-id=0 inflight-depth=8 ! \
+    video/x-raw,format=NV12,width=640,height=360 ! fakesink sync=false
+```
+
+Jobs are retired in input order. The output pool keeps `2 * inflight-depth + 4`
+buffers so a downstream converter can retain upstream outputs while both
+queues are in flight. Flush and EOS drain or discard pending jobs before the
+ACL stream and DVPP memory are destroyed.
+
+### `stream-count` Property
+
+`stream-count` selects the number of ACL streams used by the in-flight queue.
+The default is 2 and the supported range is 1-4. Each submitted job keeps its
+stream until retirement, so H2D copies and VPC requests can overlap across
+streams. Increase this value only after checking `npu-smi`; it improves
+submission concurrency but does not increase the hardware VPC limit.
+
 ### NPU and DVPP Monitoring
 
 On the current target, monitor device 0 through the NPU management tool:
@@ -143,7 +174,35 @@ watch -n 1 npu-smi info -t usages -i 64 -c 0
 ```
 
 The output includes `DVPP VPC`, `DVPP JPEGD`, `DVPP JPEGE`, `DVPP VDEC` and
-`DVPP VENC` usage counters.
+`DVPP VENC` usage counters. The current validation target is product
+`IT21PD2G10` with two NPU devices exposed through `/dev/davinci0` and
+`/dev/davinci1`.
+
+### CPU vs DVPP Multi-Stream Test
+
+The repository includes `tests/benchmark_cpu_vs_dvpp.sh`. It decodes one H.264
+file, fans the decoded NV12 frames into multiple branches, and compares CPU
+`videoscale`/`videoconvert` against `ascendvideoconvert`. Both paths produce
+640x480 BGR. The decode and common NV12 preparation stay outside the comparison:
+
+```bash
+# Prepare an input file with any available H.264 encoder.
+gst-launch-1.0 -e videotestsrc num-buffers=600 ! \
+    video/x-raw,format=I420,width=1920,height=1080,framerate=30/1 ! \
+    openh264enc bitrate=12000000 ! h264parse ! filesink location=test.h264
+
+# CPU conversion baseline.
+BRANCHES=6 DURATION=20 tests/benchmark_cpu_vs_dvpp.sh cpu test.h264
+
+# Ascend DVPP conversion.
+source /usr/local/Ascend/cann-9.1.0-beta.1/set_env.sh
+export GST_PLUGIN_PATH_1_0="$PWD/build-ascend"
+BRANCHES=6 DURATION=20 tests/benchmark_cpu_vs_dvpp.sh dvpp test.h264
+```
+
+Set `GST_SHARK_CPUUSAGE=1` when the optional `cpuusage` tracer is installed.
+Without it, the script samples the `gst-launch-1.0` process with `ps` and
+always samples device counters with `npu-smi`.
 
 ### Measured Occupancy
 
@@ -154,15 +213,46 @@ CANN 9.1.0-beta.1. `npu-smi` was sampled every 0.2 seconds with
 | workload | test load | observed occupancy |
 | --- | --- | --- |
 | VPC sustained load | 16 concurrent branches, 1920x1080 NV12 -> 640x360 NV12, time-limited stress run | DVPP VPC 17-18% after preroll; DDR 3%; AICPU 3-5%; CtrlCPU 1-6% in the stable phase |
+| Upstream-DVPP VPC load | 8 concurrent branches, 1920x1080 NV12@60 -> 640x360 NV12, `inflight-depth=8`, `stream-count=1/2` | DVPP VPC stable at 5%; DDR 3-4%; AICPU 1-2%; CtrlCPU 1-5% after warm-up |
+| CPU vs DVPP conversion | 6 branches, one 600-frame 1920x1080 H.264 input, NV12 -> 640x480 BGR | CPU baseline: host process 417%; DVPP: host process 100%, DVPP VPC 1.5%, CtrlCPU 4% |
 | JPEGD/JPEGE | 320x240 NV12@30 -> JPEGE -> JPEGD -> NV12, 300 frames in 9.97 seconds | DVPP JPEGE peak 1%; DVPP JPEGD peak 1%; DDR 3% |
 
 The VPC sustained-load run was intentionally time-limited and is an occupancy
-measurement, not a complete EOS throughput benchmark. The current element
-implementation synchronizes each VPC request and copies every frame through
-host memory, so this result is an implementation stress result rather than a
-hardware saturation result. The DVPP columns are instantaneous integer-percent
-readings and should be interpreted together with the pipeline result and
-sampling interval.
+measurement, not a complete EOS throughput benchmark. The DVPP columns are
+instantaneous integer-percent readings and should be interpreted together with
+the pipeline result and sampling interval.
+
+### Optimization Progress
+
+The current branch contains three incremental optimizations:
+
+1. DVPP-backed output allocation. A converter output can be allocated by the
+   `AscendDVPP` allocator, and a following converter uses its device pointer
+   directly. The converter also proposes that allocator upstream, so an
+   allocator-aware source can produce DVPP memory at the source pad.
+2. In-flight VPC submission. `inflight-depth` enqueues asynchronous H2D/VPC
+   work and retires frames in order. A hardware test with depth 4, 640x480
+   NV12 -> 320x240 NV12 and 30 frames completed EOS successfully.
+3. Stream and runtime overhead reduction. `stream-count` distributes jobs over
+   up to four ACL streams, while a thread-local runtime cache avoids repeating
+   `aclrtSetDevice` on the same active runtime generation.
+
+Large system-memory inputs still allocate temporary DVPP input buffers per
+   frame when the upstream element does not accept the allocation query. On
+   the current target, `videotestsrc` accepted the proposal and the converter
+   debug path reported `input-device=1 output-device=1`.
+
+The upstream-DVPP stress run used 8 branches at 1920x1080 NV12@60 -> 640x360
+NV12 with `inflight-depth=8`. Both `stream-count=1` and `stream-count=2`
+reported a stable DVPP VPC value of 5% (DDR 3-4%, AICPU 1-2%). The equivalent
+30 fps run was stable at 2%. These are sampled occupancy values, not a
+hardware saturation benchmark.
+
+The CPU-vs-DVPP run reduced the measured host GStreamer process CPU from 417%
+to 100%, an observed reduction of about 76%. The DVPP branch moved the resize
+and NV12-to-BGR conversion to VPC; decode and the common NV12 preparation
+remained on the host, so the result measures conversion offload rather than an
+end-to-end hardware decode pipeline.
 
 ### Host-only Mock Backend
 
@@ -199,7 +289,7 @@ The mock backend does not validate hardware output quality or performance.
 | `libacl_dvpp_mpi.so: cannot open shared object file` | CANN environment was not loaded | source the CANN `set_env.sh` before running GStreamer |
 | `ctx is NULL` or `acldvppMalloc failed` | streaming thread has no ACL device context | use the current source with per-thread device activation and verify `device-id` |
 | `not negotiated` | caps or dimensions are unsupported | specify NV12/raw caps explicitly and check product limits |
-| VDEC/VENC callback timeout | CANN report processing is not running or input is incomplete | use complete access units; VDEC/VENC report-loop integration is still pending in this version |
+| VDEC/VENC callback timeout | the target stream is incomplete, unsupported, or the device report worker cannot process it | use complete access units and verify the selected product's codec support; the current target has only been validated with the H.264/H.265 smoke streams described in `docs/hardware-matrix.md` |
 | `/dev/davinci*` is missing | Ascend driver or container device mapping is unavailable | run on a target with the Ascend driver and device nodes exposed |
 
 ## Acknowledgements
