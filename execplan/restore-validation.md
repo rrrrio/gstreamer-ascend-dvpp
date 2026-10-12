@@ -59,8 +59,9 @@ reproducible record of which physical codec streams have actually passed.
 - [x] (2026-10-12 21:25 +0800) Updated the README files, design notes, and
   hardware matrix to record the H.265 evidence while keeping broader profiles
   and rate-control combinations unverified.
-- [ ] Create the first repository commit after the configured pre-commit
-  security hooks are runnable in this environment.
+- [x] (2026-10-12 21:58 +0800) Created the first repository commit after
+  running the configured pre-commit suite, including gitleaks, in a writable
+  temporary hook cache.
 
 ## Surprises & Discoveries
 
