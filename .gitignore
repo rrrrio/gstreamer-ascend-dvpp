@@ -6,3 +6,4 @@ subprojects/
 *.a
 *.log
 .cache/
+execplan/
